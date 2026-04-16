@@ -20,19 +20,22 @@ FOLDER STRUCTURE:
 
 TWO MODES — detected automatically:
 
-  PO MODE  (file has "HS Code" sheet — LG Korea PO Master)
-    The PO is a master catalog of all upcoming items, no translations included.
+  PO MODE  (file has "SPM_Recommend" or "HS Code" sheet — LG Korea PO Master)
+    Drop the raw PO file from LG Korea.  Only rows with a French Designation
+    in SPM_Recommend are processed (the actual PO items).
     Output: 3 sheets
-      Sheet 1 — Coverage        (all items — overview)
-      Sheet 2 — Need Translation (NEW items — paste to Claude)
-      Sheet 3 — Ready           (items already in DB — translation auto-filled)
+      Sheet 1 — Check Results   (all PO items — full audit)
+      Sheet 2 — Need Translation (NEW items — not in DB, paste to Claude)
+      Sheet 3 — Ready           (NO CHANGE — PO translation confirmed vs DB)
 
   MEINV MODE  (file has "DATA DETAILS" sheet — raw MEINV from LG portal)
-    The invoice carries LG Korea's French designation.  Compare vs DB.
+    Drop the raw MEINV directly from the LG portal.  The invoice carries
+    LG Korea's French Designation — this tool compares it against your DB.
+    After review, move the MEINV file to db/ to add it to history.
     Output: 3 sheets
       Sheet 1 — Status Check    (all rows — full audit)
       Sheet 2 — Changed         (translation conflicts — need decision)
-      Sheet 3 — New Items       (not in DB — need translation)
+      Sheet 3 — New Items       (not in DB — invoice translation shown for reference)
 
 HOW THE DB WORKS:
   All .xlsx files in db/ are loaded and merged at runtime.
@@ -127,37 +130,40 @@ _DIV_MAP = {
 }
 
 
-def _detect_mode(path: Path) -> str:
+def _detect_mode(sheet_names: list) -> str:
     """Return 'PO', 'MEINV', or 'flat' based on sheet names."""
-    xl = pd.ExcelFile(path)
-    if "DATA DETAILS" in xl.sheet_names:
+    if "DATA DETAILS" in sheet_names:
         return "MEINV"
-    if "SPM_Recommend" in xl.sheet_names:
-        return "PO"
-    if "HS Code" in xl.sheet_names:
+    if "SPM_Recommend" in sheet_names or "HS Code" in sheet_names:
         return "PO"
     return "flat"
 
 
-def _parse_invoice_file(path: Path) -> pd.DataFrame:
+def _parse_invoice_file(path: Path) -> tuple:
     """
     Parse a single file into canonical columns:
       class, Item, translation, Designation, hs_code
-    translation is "" when the file has no translation column (PO format).
-    hs_code is "" for MEINV/flat formats (not present in those files).
+    Returns (df, mode).
+
+    translation is "" when the file has no translation column (HS Code PO format).
+    hs_code is "" for MEINV/flat formats.
 
     Handles three formats:
-      - Raw MEINV from LG Korea portal (has DATA DETAILS sheet):
+      - Raw MEINV from LG portal (DATA DETAILS sheet):
           Product → class | Item → Item | Designation → translation | Item Desc → Designation
-      - PO Master (has HS Code sheet):
+      - PO Master SPM (SPM_Recommend sheet, header row 9):
+          Div Name → class | Host Part Id → Item | Part Name → Designation
+          Designation → translation | only rows with non-empty translation kept
+      - PO Master HS Code (HS Code sheet):
           Div Name → class | Part Number → Item | Product Description → Designation
-          Customs Code → hs_code | (no translation — filled as "")
+          Customs Code → hs_code | translation = ""
       - Flat/translated format (first sheet):
           class | Item | translation | Designation
     """
     xl = pd.ExcelFile(path)
+    mode = _detect_mode(xl.sheet_names)
 
-    if "DATA DETAILS" in xl.sheet_names:
+    if mode == "MEINV":
         df = xl.parse("DATA DETAILS", dtype=str).fillna("")
         df.columns = [str(c).strip() for c in df.columns]
         df = df.rename(columns={
@@ -168,7 +174,7 @@ def _parse_invoice_file(path: Path) -> pd.DataFrame:
         })
         df["hs_code"] = ""
 
-    elif "SPM_Recommend" in xl.sheet_names:
+    elif mode == "PO" and "SPM_Recommend" in xl.sheet_names:
         # Header is on row 9 (0-indexed), real data starts after
         df = xl.parse("SPM_Recommend", header=9, dtype=str).fillna("")
         df.columns = [str(c).strip() for c in df.columns]
@@ -184,7 +190,7 @@ def _parse_invoice_file(path: Path) -> pd.DataFrame:
         # The rest are planning/forecast rows — exclude them entirely.
         df = df[df["translation"].str.strip() != ""]
 
-    elif "HS Code" in xl.sheet_names:
+    elif mode == "PO":  # HS Code sheet
         df = xl.parse("HS Code", dtype=str).fillna("")
         df.columns = [str(c).strip() for c in df.columns]
         df = df.rename(columns={
@@ -198,7 +204,7 @@ def _parse_invoice_file(path: Path) -> pd.DataFrame:
         if "hs_code" not in df.columns:
             df["hs_code"] = ""
 
-    else:
+    else:  # flat format
         df = xl.parse(xl.sheet_names[0], dtype=str).fillna("")
         df.columns = [str(c).strip() for c in df.columns]
         col_map = {}
@@ -226,13 +232,13 @@ def _parse_invoice_file(path: Path) -> pd.DataFrame:
     df = df[["class", "Item", "translation", "Designation", "hs_code"]].copy()
     for col in df.columns:
         df[col] = df[col].apply(_clean_str)
-    return df[df["Item"].str.strip() != ""].reset_index(drop=True)
+    df = df[df["Item"].str.strip() != ""].reset_index(drop=True)
+    return df, mode
 
 
 def load_invoice(path: Path):
     """Load and parse the incoming file.  Returns (df, mode)."""
-    mode = _detect_mode(path)
-    df = _parse_invoice_file(path)
+    df, mode = _parse_invoice_file(path)
     print(f"  File     : {len(df)} rows  ({path.name})")
     print(f"  Mode     : {mode}")
     return df, mode
@@ -254,7 +260,8 @@ def load_db() -> pd.DataFrame:
     frames = []
     for f in db_files:
         try:
-            frames.append(_parse_invoice_file(f))
+            df_f, _ = _parse_invoice_file(f)
+            frames.append(df_f)
         except Exception as e:
             print(f"  WARNING: skipping {f.name} — {e}")
 
@@ -442,13 +449,11 @@ def _write_output_meinv(wb, df: pd.DataFrame):
     _autofit(ws2)
 
     # ── Sheet 3: New Items ────────────────────────────────────────
-    rows3 = df[df["Status"] == NEW_ITEM].copy()
-    out3 = pd.DataFrame({
-        "class":       rows3["class"].values,
-        "Item":        rows3["Item"].values,
-        "Designation": rows3["Designation"].values,
-        "Status":      rows3["Status"].values,
-    })
+    # Invoice Translation is shown even though it's not in DB yet —
+    # it's the French term from LG Korea that the user will decide to keep or correct.
+    out3 = df[df["Status"] == NEW_ITEM][
+        ["class", "Item", "Designation", "translation", "Status"]
+    ].copy().rename(columns={"translation": "Invoice Translation"})
     ws3 = wb.create_sheet("New Items")
     ws3.sheet_properties.tabColor = "375623"
     _setup(ws3)
