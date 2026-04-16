@@ -352,19 +352,17 @@ def _write_output_po(wb, df: pd.DataFrame):
     PO mode — 3 sheets, all sharing the same 6-column layout:
       class | Item | Designation | PO Translation | DB Translation | Status
 
-      1. Check Results    — NO CHANGE + CHANGED rows (PO translation present, cross-checked vs DB)
-      2. Need Translation — NEW ITEM rows (not in DB — paste to Claude)
-      3. Ready            — IN DB rows (DB supplies the translation automatically)
-
-    PO Translation is blank on sheets 2/3 when the SPM file carries no French Designation
-    for those items — that is expected.  DB Translation is blank on sheet 2 because those
-    items are genuinely not yet in the DB.
+      1. Check Results    — ALL PO items, sorted: CHANGED → NO CHANGE → NEW ITEM
+      2. Need Translation — NEW ITEM rows (not in DB yet — paste to Claude)
+      3. Ready            — NO CHANGE rows (PO translation confirmed matching DB)
     """
-    # ── Sheet 1: Check Results ────────────────────────────────────
-    checked = df[df["translation"].str.strip() != ""].copy()
-    checked["_sort"] = checked["Status"].map({CHANGED: 0, NO_CHANGE: 1}).fillna(2)
-    checked = checked.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
-    out1 = _po_out(checked)
+    # ── Sheet 1: Check Results (full audit, all PO items) ────────
+    df_sorted = df.copy()
+    df_sorted["_sort"] = df_sorted["Status"].map(
+        {CHANGED: 0, NO_CHANGE: 1, NEW_ITEM: 2, IN_DB: 3}
+    ).fillna(4)
+    df_sorted = df_sorted.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
+    out1 = _po_out(df_sorted)
     ws1 = wb.create_sheet("Check Results")
     ws1.sheet_properties.tabColor = "2E4057"
     _setup(ws1)
@@ -390,7 +388,9 @@ def _write_output_po(wb, df: pd.DataFrame):
     _autofit(ws2)
 
     # ── Sheet 3: Ready ────────────────────────────────────────────
-    out3 = _po_out(df[df["Status"] == IN_DB].copy())
+    # NO_CHANGE: PO translation confirmed matching DB — nothing to do.
+    # IN_DB: fallback for HS Code format (PO has no translation, DB supplies it).
+    out3 = _po_out(df[df["Status"].isin([NO_CHANGE, IN_DB])].copy())
     ws3 = wb.create_sheet("Ready")
     ws3.sheet_properties.tabColor = "375623"
     _setup(ws3)
@@ -557,7 +557,7 @@ def main():
     if mode == "PO":
         print(f"    Sheet 1 — Check Results     ({total} rows)  [{n_changed} changed, {n_no_change} ok, {n_new} new]")
         print(f"    Sheet 2 — Need Translation  ({n_new} rows)  ← paste to Claude")
-        print(f"    Sheet 3 — Ready             ({n_in_db} rows)")
+        print(f"    Sheet 3 — Ready             ({n_no_change + n_in_db} rows)")
     else:
         print(f"    Sheet 1 — Status Check  ({total} rows)")
         print(f"    Sheet 2 — Changed       ({n_changed} rows)")
