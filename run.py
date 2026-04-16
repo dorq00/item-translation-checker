@@ -180,6 +180,9 @@ def _parse_invoice_file(path: Path) -> pd.DataFrame:
         })
         df["class"] = df["class"].map(lambda v: _DIV_MAP.get(v, v))
         df["hs_code"] = ""
+        # Only rows with a French Designation are actual PO items.
+        # The rest are planning/forecast rows — exclude them entirely.
+        df = df[df["translation"].str.strip() != ""]
 
     elif "HS Code" in xl.sheet_names:
         df = xl.parse("HS Code", dtype=str).fillna("")
@@ -552,7 +555,7 @@ def main():
     print(f"\n  Writing → output/{datetime.now().strftime('%Y-%m')}/{out_name}")
 
     if mode == "PO":
-        print(f"    Sheet 1 — Check Results     ({n_changed + n_no_change} rows)  [{n_changed} changed, {n_no_change} ok]")
+        print(f"    Sheet 1 — Check Results     ({total} rows)  [{n_changed} changed, {n_no_change} ok, {n_new} new]")
         print(f"    Sheet 2 — Need Translation  ({n_new} rows)  ← paste to Claude")
         print(f"    Sheet 3 — Ready             ({n_in_db} rows)")
     else:
