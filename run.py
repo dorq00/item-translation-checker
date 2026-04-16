@@ -338,28 +338,36 @@ def _setup(ws):
 
 # ── Output writers ────────────────────────────────────────────────────────────
 
+def _po_out(df_rows: pd.DataFrame) -> pd.DataFrame:
+    """Canonical 6-column layout used by all three PO output sheets."""
+    out = df_rows[["class", "Item", "Designation", "translation", "db_translation", "Status"]].copy()
+    return out.rename(columns={"translation": "PO Translation", "db_translation": "DB Translation"})
+
+
 def _write_output_po(wb, df: pd.DataFrame):
     """
-    PO mode — 3 sheets:
-      1. Check Results    — ONLY the rows that had a PO translation (NO CHANGE + CHANGED)
-                            This is the actual verification: PO translation vs DB.
-      2. Need Translation — NEW ITEM rows (no translation in PO or DB — paste to Claude)
-      3. Ready            — IN DB rows (no PO translation, DB supplies it automatically)
+    PO mode — 3 sheets, all sharing the same 6-column layout:
+      class | Item | Designation | PO Translation | DB Translation | Status
+
+      1. Check Results    — NO CHANGE + CHANGED rows (PO translation present, cross-checked vs DB)
+      2. Need Translation — NEW ITEM rows (not in DB — paste to Claude)
+      3. Ready            — IN DB rows (DB supplies the translation automatically)
+
+    PO Translation is blank on sheets 2/3 when the SPM file carries no French Designation
+    for those items — that is expected.  DB Translation is blank on sheet 2 because those
+    items are genuinely not yet in the DB.
     """
-    # ── Sheet 1: Check Results (only rows with a PO translation) ──
+    # ── Sheet 1: Check Results ────────────────────────────────────
     checked = df[df["translation"].str.strip() != ""].copy()
-    # Sort: CHANGED first (needs action), then NO CHANGE
     checked["_sort"] = checked["Status"].map({CHANGED: 0, NO_CHANGE: 1}).fillna(2)
     checked = checked.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
-    out1 = checked[["class", "Item", "Designation", "translation", "db_translation", "Status"]].copy()
-    out1 = out1.rename(columns={"translation": "PO Translation", "db_translation": "DB Translation"})
+    out1 = _po_out(checked)
     ws1 = wb.create_sheet("Check Results")
     ws1.sheet_properties.tabColor = "2E4057"
     _setup(ws1)
     _write_header(ws1, list(out1.columns), _fill("2E4057"))
     _write_rows(ws1, out1)
     _color_status_col(ws1, out1, "Status")
-    # Highlight PO vs DB translation columns
     po_ci = list(out1.columns).index("PO Translation") + 1
     db_ci = list(out1.columns).index("DB Translation") + 1
     for ri in range(2, len(out1) + 2):
@@ -369,26 +377,23 @@ def _write_output_po(wb, df: pd.DataFrame):
     _autofit(ws1)
 
     # ── Sheet 2: Need Translation ─────────────────────────────────
-    # PO Translation is structurally empty for NEW_ITEM rows (no DB match, no PO designation)
-    # — omit it to avoid a column of NaN noise.
-    new_rows = df[df["Status"] == NEW_ITEM][["class", "Item", "Designation"]].copy()
+    out2 = _po_out(df[df["Status"] == NEW_ITEM].copy())
     ws2 = wb.create_sheet("Need Translation")
     ws2.sheet_properties.tabColor = "C55A11"
     _setup(ws2)
-    _write_header(ws2, list(new_rows.columns), _fill("C55A11"))
-    _write_rows(ws2, new_rows)
+    _write_header(ws2, list(out2.columns), _fill("C55A11"))
+    _write_rows(ws2, out2)
+    _color_status_col(ws2, out2, "Status")
     _autofit(ws2)
 
     # ── Sheet 3: Ready ────────────────────────────────────────────
-    # IN_DB items always have translation="" (no PO designation) — omit that dead column.
-    # "DB Translation" is the only translation that matters here; call it "Translation".
-    ready_rows = df[df["Status"] == IN_DB][["class", "Item", "Designation", "db_translation"]].copy()
-    ready_rows = ready_rows.rename(columns={"db_translation": "Translation"})
+    out3 = _po_out(df[df["Status"] == IN_DB].copy())
     ws3 = wb.create_sheet("Ready")
     ws3.sheet_properties.tabColor = "375623"
     _setup(ws3)
-    _write_header(ws3, list(ready_rows.columns), _fill("375623"))
-    _write_rows(ws3, ready_rows)
+    _write_header(ws3, list(out3.columns), _fill("375623"))
+    _write_rows(ws3, out3)
+    _color_status_col(ws3, out3, "Status")
     _autofit(ws3)
 
 
