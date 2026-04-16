@@ -1,31 +1,44 @@
 """
 translation_checker — run.py
 =============================
-Drop your invoice in  invoices/incoming/
-Double-click          START_CHECKER.bat
+Drop your file in    invoices/incoming/
+Double-click         START_CHECKER.bat
 Done — output lands in output/YYYY-MM/
 
 FOLDER STRUCTURE:
   translation_checker/
   ├── run.py                   ← this file
   ├── START_CHECKER.bat        ← double-click launcher
-  ├── db/                      ← past MEINV invoices go here (history)
-  │   ├── MEINV00084440.xlsx
-  │   ├── MEINV00085066.xlsx
+  ├── db/                      ← translation history (all .xlsx files are loaded)
+  │   ├── Historical_Translation.xlsx   (seed — curated base)
+  │   ├── MEINV00084440.xlsx            (past invoices moved here after review)
   │   └── ...
   ├── invoices/
-  │   └── incoming/            ← drop the NEW invoice here before running
+  │   └── incoming/            ← drop your file here before running
   └── output/
       └── 2026-04/             ← auto-created, organized by month
-          └── check_<invoice>_<datetime>.xlsx   ← single workbook, 3 sheets:
-              Sheet 1 — Status Check  (all rows)
-              Sheet 2 — Changed       (translation conflicts)
-              Sheet 3 — New Items     (not in DB, need translation)
+
+TWO MODES — detected automatically:
+
+  PO MODE  (file has "HS Code" sheet — LG Korea PO Master)
+    The PO is a master catalog of all upcoming items, no translations included.
+    Output: 3 sheets
+      Sheet 1 — Coverage        (all items — overview)
+      Sheet 2 — Need Translation (NEW items — paste to Claude)
+      Sheet 3 — Ready           (items already in DB — translation auto-filled)
+
+  MEINV MODE  (file has "DATA DETAILS" sheet — raw MEINV from LG portal)
+    The invoice carries LG Korea's French designation.  Compare vs DB.
+    Output: 3 sheets
+      Sheet 1 — Status Check    (all rows — full audit)
+      Sheet 2 — Changed         (translation conflicts — need decision)
+      Sheet 3 — New Items       (not in DB — need translation)
 
 HOW THE DB WORKS:
-  All .xlsx files in db/ are loaded and combined as the translation history.
-  After reviewing a new invoice, move it from invoices/incoming/ into db/
-  so future runs treat it as history.
+  All .xlsx files in db/ are loaded and merged at runtime.
+  Files are sorted by name — later file wins on duplicate Item.
+  To add translations: save a file with columns class|Item|Designation|translation
+  and drop it in db/.  No other step needed.
 """
 
 import os
@@ -113,19 +126,33 @@ _DIV_MAP = {
     "REF": "RF", "LTV": "TV", "MNT": "TV",
 }
 
+
+def _detect_mode(path: Path) -> str:
+    """Return 'PO', 'MEINV', or 'flat' based on sheet names."""
+    xl = pd.ExcelFile(path)
+    if "DATA DETAILS" in xl.sheet_names:
+        return "MEINV"
+    if "SPM_Recommend" in xl.sheet_names:
+        return "PO"
+    if "HS Code" in xl.sheet_names:
+        return "PO"
+    return "flat"
+
+
 def _parse_invoice_file(path: Path) -> pd.DataFrame:
     """
-    Parse a single invoice file into canonical columns:
-      class, Item, translation, Designation
+    Parse a single file into canonical columns:
+      class, Item, translation, Designation, hs_code
     translation is "" when the file has no translation column (PO format).
+    hs_code is "" for MEINV/flat formats (not present in those files).
 
     Handles three formats:
       - Raw MEINV from LG Korea portal (has DATA DETAILS sheet):
           Product → class | Item → Item | Designation → translation | Item Desc → Designation
       - PO Master (has HS Code sheet):
           Div Name → class | Part Number → Item | Product Description → Designation
-          (no translation — filled as "")
-      - Flat/transformed format (first sheet):
+          Customs Code → hs_code | (no translation — filled as "")
+      - Flat/translated format (first sheet):
           class | Item | translation | Designation
     """
     xl = pd.ExcelFile(path)
@@ -139,17 +166,34 @@ def _parse_invoice_file(path: Path) -> pd.DataFrame:
             "Designation": "translation",
             "Item Desc":   "Designation",
         })
+        df["hs_code"] = ""
+
+    elif "SPM_Recommend" in xl.sheet_names:
+        # Header is on row 9 (0-indexed), real data starts after
+        df = xl.parse("SPM_Recommend", header=9, dtype=str).fillna("")
+        df.columns = [str(c).strip() for c in df.columns]
+        df = df.rename(columns={
+            "Host Part Id": "Item",
+            "Part Name":    "Designation",
+            "Designation":  "translation",
+            "Div Name":     "class",
+        })
+        df["class"] = df["class"].map(lambda v: _DIV_MAP.get(v, v))
+        df["hs_code"] = ""
 
     elif "HS Code" in xl.sheet_names:
         df = xl.parse("HS Code", dtype=str).fillna("")
         df.columns = [str(c).strip() for c in df.columns]
         df = df.rename(columns={
-            "Div Name":           "class",
-            "Part Number":        "Item",
+            "Div Name":            "class",
+            "Part Number":         "Item",
             "Product Description": "Designation",
+            "Customs Code":        "hs_code",
         })
         df["class"] = df["class"].map(lambda v: _DIV_MAP.get(v, v))
         df["translation"] = ""
+        if "hs_code" not in df.columns:
+            df["hs_code"] = ""
 
     else:
         df = xl.parse(xl.sheet_names[0], dtype=str).fillna("")
@@ -157,13 +201,16 @@ def _parse_invoice_file(path: Path) -> pd.DataFrame:
         col_map = {}
         for c in df.columns:
             lc = c.lower()
-            if lc == "class":            col_map[c] = "class"
-            elif lc == "item":           col_map[c] = "Item"
-            elif lc == "translation":    col_map[c] = "translation"
-            elif lc == "designation":    col_map[c] = "Designation"
+            if lc == "class":         col_map[c] = "class"
+            elif lc == "item":        col_map[c] = "Item"
+            elif lc == "translation": col_map[c] = "translation"
+            elif lc == "designation": col_map[c] = "Designation"
+            elif lc in ("hs_code", "hs code", "customs code"): col_map[c] = "hs_code"
         df = df.rename(columns=col_map)
         if "translation" not in df.columns:
             df["translation"] = ""
+        if "hs_code" not in df.columns:
+            df["hs_code"] = ""
 
     required = {"class", "Item", "Designation"}
     missing = required - set(df.columns)
@@ -173,17 +220,19 @@ def _parse_invoice_file(path: Path) -> pd.DataFrame:
             f"  Found: {list(df.columns)}"
         )
 
-    df = df[["class", "Item", "translation", "Designation"]].copy()
+    df = df[["class", "Item", "translation", "Designation", "hs_code"]].copy()
     for col in df.columns:
         df[col] = df[col].apply(_clean_str)
     return df[df["Item"].str.strip() != ""].reset_index(drop=True)
 
 
-def load_invoice(path: Path) -> pd.DataFrame:
-    """Load and parse the single incoming invoice."""
+def load_invoice(path: Path):
+    """Load and parse the incoming file.  Returns (df, mode)."""
+    mode = _detect_mode(path)
     df = _parse_invoice_file(path)
-    print(f"  Invoice  : {len(df)} rows  ({path.name})")
-    return df
+    print(f"  File     : {len(df)} rows  ({path.name})")
+    print(f"  Mode     : {mode}")
+    return df, mode
 
 
 def load_db() -> pd.DataFrame:
@@ -211,8 +260,10 @@ def load_db() -> pd.DataFrame:
 
     df = pd.concat(frames, ignore_index=True)
     df = df[df["Item"].str.strip() != ""]
+    # Only keep rows that actually have a translation (DB rows without one are useless as lookup)
+    df = df[df["translation"].str.strip() != ""]
     df = df.drop_duplicates(subset="Item", keep="last").reset_index(drop=True)
-    print(f"  DB       : {len(df)} unique items  ({len(db_files)} invoice files)")
+    print(f"  DB       : {len(df)} unique items  ({len(db_files)} files)")
     return df
 
 # ── Check logic ───────────────────────────────────────────────────────────────
@@ -227,6 +278,8 @@ def classify(df_invoice: pd.DataFrame, df_db: pd.DataFrame) -> pd.DataFrame:
     )
     df = df_invoice.merge(db_lookup, on="Item", how="left")
     df["db_translation"] = df["db_translation"].fillna("")
+    if "hs_code" not in df.columns:
+        df["hs_code"] = ""
 
     def _status(row):
         if row["db_translation"] == "":
@@ -283,13 +336,69 @@ def _setup(ws):
     ws.freeze_panes = "A2"
     ws.sheet_view.showGridLines = False
 
-# ── Output writer ─────────────────────────────────────────────────────────────
+# ── Output writers ────────────────────────────────────────────────────────────
 
-def write_output(path: Path, df: pd.DataFrame):
-    """Single workbook with 3 sheets: Status Check, Changed, New Items."""
-    wb = openpyxl.Workbook()
-    wb.remove(wb.active)
+def _write_output_po(wb, df: pd.DataFrame):
+    """
+    PO mode — 3 sheets:
+      1. Check Results    — ONLY the rows that had a PO translation (NO CHANGE + CHANGED)
+                            This is the actual verification: PO translation vs DB.
+      2. Need Translation — NEW ITEM rows (no translation in PO or DB — paste to Claude)
+      3. Ready            — IN DB rows (no PO translation, DB supplies it automatically)
+    """
+    # ── Sheet 1: Check Results (only rows with a PO translation) ──
+    checked = df[df["translation"].str.strip() != ""].copy()
+    # Sort: CHANGED first (needs action), then NO CHANGE
+    checked["_sort"] = checked["Status"].map({CHANGED: 0, NO_CHANGE: 1}).fillna(2)
+    checked = checked.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
+    out1 = checked[["class", "Item", "Designation", "translation", "db_translation", "Status"]].copy()
+    out1 = out1.rename(columns={"translation": "PO Translation", "db_translation": "DB Translation"})
+    ws1 = wb.create_sheet("Check Results")
+    ws1.sheet_properties.tabColor = "2E4057"
+    _setup(ws1)
+    _write_header(ws1, list(out1.columns), _fill("2E4057"))
+    _write_rows(ws1, out1)
+    _color_status_col(ws1, out1, "Status")
+    # Highlight PO vs DB translation columns
+    po_ci = list(out1.columns).index("PO Translation") + 1
+    db_ci = list(out1.columns).index("DB Translation") + 1
+    for ri in range(2, len(out1) + 2):
+        if out1.iloc[ri - 2]["Status"] == CHANGED:
+            ws1.cell(ri, po_ci).fill = _fill("FCE4D6")
+            ws1.cell(ri, db_ci).fill = _fill("DDEBF7")
+    _autofit(ws1)
 
+    # ── Sheet 2: Need Translation ─────────────────────────────────
+    # PO Translation is structurally empty for NEW_ITEM rows (no DB match, no PO designation)
+    # — omit it to avoid a column of NaN noise.
+    new_rows = df[df["Status"] == NEW_ITEM][["class", "Item", "Designation"]].copy()
+    ws2 = wb.create_sheet("Need Translation")
+    ws2.sheet_properties.tabColor = "C55A11"
+    _setup(ws2)
+    _write_header(ws2, list(new_rows.columns), _fill("C55A11"))
+    _write_rows(ws2, new_rows)
+    _autofit(ws2)
+
+    # ── Sheet 3: Ready ────────────────────────────────────────────
+    # IN_DB items always have translation="" (no PO designation) — omit that dead column.
+    # "DB Translation" is the only translation that matters here; call it "Translation".
+    ready_rows = df[df["Status"] == IN_DB][["class", "Item", "Designation", "db_translation"]].copy()
+    ready_rows = ready_rows.rename(columns={"db_translation": "Translation"})
+    ws3 = wb.create_sheet("Ready")
+    ws3.sheet_properties.tabColor = "375623"
+    _setup(ws3)
+    _write_header(ws3, list(ready_rows.columns), _fill("375623"))
+    _write_rows(ws3, ready_rows)
+    _autofit(ws3)
+
+
+def _write_output_meinv(wb, df: pd.DataFrame):
+    """
+    MEINV mode — 3 sheets:
+      1. Status Check — full audit, all rows
+      2. Changed      — translation conflicts
+      3. New Items    — not in DB
+    """
     # ── Sheet 1: Status Check ─────────────────────────────────────
     out = df[["class", "Item", "translation", "db_translation", "Designation", "Status"]].copy()
     out = out.rename(columns={"translation": "Invoice Translation", "db_translation": "DB Translation"})
@@ -340,6 +449,15 @@ def write_output(path: Path, df: pd.DataFrame):
     _color_status_col(ws3, out3, "Status")
     _autofit(ws3)
 
+
+def write_output(path: Path, df: pd.DataFrame, mode: str):
+    """Dispatch to the correct writer based on mode."""
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    if mode == "PO":
+        _write_output_po(wb, df)
+    else:
+        _write_output_meinv(wb, df)
     wb.save(path)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -370,7 +488,7 @@ def main():
     INCOMING.mkdir(parents=True, exist_ok=True)
     DB_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── Find invoice in incoming/ ─────────────────────────────────
+    # ── Find file in incoming/ ────────────────────────────────────
     invoices = sorted(
         [f for f in INCOMING.iterdir() if f.suffix.lower() == ".xlsx" and not f.name.startswith("~$")],
         key=lambda f: f.stat().st_mtime,
@@ -378,23 +496,23 @@ def main():
     )
     if not invoices:
         abort(
-            f"No invoice found in:\n  {INCOMING}\n\n"
-            f"Drop your .xlsx invoice there and try again."
+            f"No .xlsx file found in:\n  {INCOMING}\n\n"
+            f"Drop your PO or MEINV file there and try again."
         )
 
     invoice_path = invoices[0]
     if len(invoices) > 1:
-        print(f"\n  NOTE: {len(invoices)} invoices in incoming/ — using most recent.")
+        print(f"\n  NOTE: {len(invoices)} files in incoming/ — using most recent.")
         print(f"  Others: {[f.name for f in invoices[1:]]}")
 
-    print(f"\n  Invoice  : {invoice_path.name}")
+    print(f"\n  File     : {invoice_path.name}")
     print()
 
     # ── Load ──────────────────────────────────────────────────────
     print("  Loading data...")
     try:
-        df_invoice = load_invoice(invoice_path)
-        df_db      = load_db()
+        df_invoice, mode = load_invoice(invoice_path)
+        df_db            = load_db()
     except Exception as e:
         abort(str(e))
 
@@ -412,11 +530,11 @@ def main():
     total       = len(df_classified)
 
     print(f"\n  {'─' * 44}")
-    print(f"  Total    : {total} lines")
+    print(f"  Total    : {total} rows")
     if n_no_change: print(f"  {NO_CHANGE}  : {n_no_change}")
-    if n_in_db:     print(f"  {IN_DB}       : {n_in_db}  (translation auto-filled from DB)")
-    if n_changed:   print(f"  {CHANGED}    : {n_changed}")
-    print(f"  {NEW_ITEM}   : {n_new}  (need translation)")
+    if n_in_db:     print(f"  {IN_DB}       : {n_in_db}  (translation ready)")
+    if n_changed:   print(f"  {CHANGED}    : {n_changed}  (needs review)")
+    if n_new:       print(f"  {NEW_ITEM}   : {n_new}  (needs translation)")
     print(f"  {'─' * 44}")
 
     # ── Write output ──────────────────────────────────────────────
@@ -427,13 +545,28 @@ def main():
     out_path = month_dir / out_name
 
     print(f"\n  Writing → output/{datetime.now().strftime('%Y-%m')}/{out_name}")
-    write_output(out_path, df_classified)
-    print(f"    Sheet 1 — Status Check  ({total} rows)")
-    print(f"    Sheet 2 — Changed       ({n_changed} rows)")
-    print(f"    Sheet 3 — New Items     ({n_new} rows)")
+
+    if mode == "PO":
+        print(f"    Sheet 1 — Check Results     ({n_changed + n_no_change} rows)  [{n_changed} changed, {n_no_change} ok]")
+        print(f"    Sheet 2 — Need Translation  ({n_new} rows)  ← paste to Claude")
+        print(f"    Sheet 3 — Ready             ({n_in_db} rows)")
+    else:
+        print(f"    Sheet 1 — Status Check  ({total} rows)")
+        print(f"    Sheet 2 — Changed       ({n_changed} rows)")
+        print(f"    Sheet 3 — New Items     ({n_new} rows)")
+
+    write_output(out_path, df_classified, mode)
 
     print(f"\n  [DONE]  {out_path}")
-    print(f"\n  TIP: Once reviewed, move {invoice_path.name} → db/ to add it to history.")
+
+    if mode == "PO":
+        print(f"\n  NEXT STEPS:")
+        print(f"    1. Open Sheet 2 (Need Translation) — {n_new} items need French customs terms")
+        print(f"    2. Paste to Claude with the translation prompt")
+        print(f"    3. Save result as xlsx with columns: class | Item | Designation | translation")
+        print(f"    4. Drop that file into db/ — done, future runs will find these items")
+    else:
+        print(f"\n  TIP: Once reviewed, move {invoice_path.name} → db/ to add it to history.")
 
     try:
         os.startfile(out_path)
